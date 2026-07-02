@@ -50,7 +50,7 @@ curl -v http://localhost:8080/health   # local health test
 ## Fresh VM setup / Oracle migration
 
 ```bash
-git clone https://github.com/YOURUSERNAME/er-bridge.git
+git clone https://github.com/FoxBahn/er-bridge.git
 cd er-bridge
 npm install whatsapp-web.js qrcode-terminal qrcode
 pm2 start index.js --name "er-bridge" --update-env
