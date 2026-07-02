@@ -18,7 +18,7 @@ const QRCode = require('qrcode');
 // ===================================================
 // CONFIG — CHANGE THE SECRET KEY BEFORE DEPLOYING
 // ===================================================
-const SECRET_KEY = 'CHANGE-THIS-TO-A-LONG-RANDOM-STRING';
+const SECRET_KEY = '0c3BiP>^8/<%s)2`2B1WtMfYEW£{Fb';
 const TARGET_GROUP = '120363408545190910@g.us';
 const MY_PERSONAL_NUMBER = '27731511664@c.us';
 const PORT = 8080;
