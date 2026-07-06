@@ -1,10 +1,12 @@
 // ===================================================
-// ER-BRIDGE v2 — WhatsApp Alert Bridge with Self-Monitoring
+// ER-BRIDGE v2.1 — WhatsApp Alert Bridge with Self-Monitoring
 // Architecture notes:
 // - NO internal timers/cron. All "clock" behaviour piggybacks on
 //   Google Uptime Monitor's 60-second pings to /health.
-// - Health check now reflects WHATSAPP state, not just Node state.
+// - Health check reflects WHATSAPP state, not just Node state.
 //   Session drops => /health returns 503 => Uptime check fails => you get emailed.
+// - Detached frame / session errors now correctly flip clientReady=false
+//   so the watchdog catches silent WhatsApp disconnections.
 // - Control panel routes are protected by SECRET_KEY.
 // Dependencies: npm install whatsapp-web.js qrcode-terminal qrcode
 // ===================================================
@@ -27,7 +29,7 @@ const PORT = 8080;
 // STATE & IN-MEMORY LOG BUFFER (last 150 lines)
 // ===================================================
 let clientReady = false;
-let latestQR = null;             // holds QR string whenever a rescan is needed
+let latestQR = null;
 const stats = {
     startedAt: new Date(),
     forwarded: 0,
@@ -42,6 +44,23 @@ function log(line) {
     console.log(entry);
     logBuffer.push(entry);
     if (logBuffer.length > 150) logBuffer.shift();
+}
+
+// ===================================================
+// HELPER — detects Puppeteer "detached frame" / session errors
+// These mean the WhatsApp browser context has died internally.
+// We treat them the same as a disconnection — flip clientReady=false
+// so /health returns 503 and the uptime watchdog emails you.
+// ===================================================
+function isSessionError(err) {
+    const msg = err.message || '';
+    return (
+        msg.includes('detached Frame') ||
+        msg.includes('Execution context was destroyed') ||
+        msg.includes('Session closed') ||
+        msg.includes('Target closed') ||
+        msg.includes('Protocol error')
+    );
 }
 
 // ===================================================
@@ -103,11 +122,24 @@ client.on('message', async (msg) => {
     } catch (err) {
         stats.failures++;
         log(`❌ FAILURE delivering to group: ${err.message}`);
+
+        // KEY LESSON: if this is a session/frame error, the WhatsApp
+        // browser context has died. Mark as not ready so /health returns
+        // 503 and the uptime watchdog fires an email alert.
+        if (isSessionError(err)) {
+            clientReady = false;
+            log('🔌 Session error detected during send — marking bridge as DISCONNECTED.');
+        }
+
         try {
             await client.sendMessage(MY_PERSONAL_NUMBER,
                 `🚨 ER-BRIDGE ERROR: Alert failed to deliver to group.\nContent: ${msg.body}`);
         } catch (backupErr) {
             log(`🚨 Double failure — backup route offline: ${backupErr.message}`);
+            if (isSessionError(backupErr)) {
+                clientReady = false;
+                log('🔌 Session error on backup route — marking bridge as DISCONNECTED.');
+            }
         }
     }
 });
@@ -116,6 +148,12 @@ client.on('message', async (msg) => {
 // DAILY DIGEST — clocked by Google's pings, no internal timers.
 // On each /health ping, if the calendar date has rolled over,
 // send yesterday's summary to your personal number.
+//
+// LESSON: We now wrap this in isSessionError() detection.
+// Previously a detached frame here would fail silently — the digest
+// error was swallowed, clientReady stayed true, and the watchdog
+// never knew WhatsApp had broken. Now it correctly flags the bridge
+// as disconnected so you get emailed.
 // ===================================================
 async function maybeSendDailyDigest() {
     const today = new Date().toDateString();
@@ -133,13 +171,19 @@ async function maybeSendDailyDigest() {
         log('📊 Daily digest sent.');
     } catch (e) {
         log(`Digest send failed: ${e.message}`);
+        // If the digest fails with a session error, flip the health check
+        // so the uptime watchdog catches it and emails you.
+        if (isSessionError(e)) {
+            clientReady = false;
+            log('🔌 Session error detected during digest — marking bridge as DISCONNECTED.');
+        }
     }
 }
 
 // ===================================================
 // HTTP GATEWAY + CONTROL PANEL
 // Routes:
-//   /health            (public)  200 if WhatsApp connected, 503 if not — point Uptime Monitor here
+//   /health            (public)  200 if WhatsApp connected, 503 if not
 //   /status?key=SECRET           JSON stats
 //   /logs?key=SECRET             last 150 log lines as plain text
 //   /qr?key=SECRET               scannable QR image in browser when session drops
@@ -152,7 +196,7 @@ http.createServer(async (req, res) => {
 
     // --- Public health check (Google Uptime Monitor target) ---
     if (u.pathname === '/health' || u.pathname === '/') {
-        maybeSendDailyDigest(); // piggyback the daily clock on Google's pings
+        maybeSendDailyDigest();
         if (clientReady) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'ALIVE', whatsapp: 'CONNECTED', engine: 'GCP-ALERT-BRIDGE' }));
@@ -212,7 +256,7 @@ http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
         res.end('♻️ Restarting via PM2...');
         log('♻️ Manual restart triggered via control panel.');
-        setTimeout(() => process.exit(0), 500); // PM2 auto-restarts the process
+        setTimeout(() => process.exit(0), 500);
         return;
     }
 
