@@ -1,13 +1,14 @@
 // ===================================================
-// ER-BRIDGE v2.1 — WhatsApp Alert Bridge with Self-Monitoring
+// ER-BRIDGE v2.2 — WhatsApp Alert Bridge with Self-Healing
 // Architecture notes:
 // - NO internal timers/cron. All "clock" behaviour piggybacks on
 //   Google Uptime Monitor's 60-second pings to /health.
 // - Health check reflects WHATSAPP state, not just Node state.
 //   Session drops => /health returns 503 => Uptime check fails => you get emailed.
-// - Detached frame / session errors now correctly flip clientReady=false
-//   so the watchdog catches silent WhatsApp disconnections.
-// - Control panel routes are protected by SECRET_KEY.
+// - v2.1: Detached frame / session errors correctly flip clientReady=false
+// - v2.2: Bridge now self-heals on session errors — automatically destroys
+//   and reinitialises the WhatsApp client instead of waiting for manual restart.
+//   A cooldown guard prevents infinite reconnection loops.
 // Dependencies: npm install whatsapp-web.js qrcode-terminal qrcode
 // ===================================================
 
@@ -18,7 +19,7 @@ const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 
 // ===================================================
-// CONFIG — CHANGE THE SECRET KEY BEFORE DEPLOYING
+// CONFIG
 // ===================================================
 const SECRET_KEY = '0c3BiP>^8/<%s)2`2B1WtMfYEW£{Fb';
 const TARGET_GROUP = '120363408545190910@g.us';
@@ -30,11 +31,13 @@ const PORT = 8080;
 // ===================================================
 let clientReady = false;
 let latestQR = null;
+let isReconnecting = false;  // cooldown guard — prevents reconnection loops
 const stats = {
     startedAt: new Date(),
     forwarded: 0,
     failures: 0,
-    lastAlertAt: null
+    lastAlertAt: null,
+    reconnections: 0      // track how often self-healing fires
 };
 let lastDigestDate = new Date().toDateString();
 
@@ -47,10 +50,8 @@ function log(line) {
 }
 
 // ===================================================
-// HELPER — detects Puppeteer "detached frame" / session errors
+// HELPER — detects Puppeteer session-level errors
 // These mean the WhatsApp browser context has died internally.
-// We treat them the same as a disconnection — flip clientReady=false
-// so /health returns 503 and the uptime watchdog emails you.
 // ===================================================
 function isSessionError(err) {
     const msg = err.message || '';
@@ -61,6 +62,46 @@ function isSessionError(err) {
         msg.includes('Target closed') ||
         msg.includes('Protocol error')
     );
+}
+
+// ===================================================
+// SELF-HEALING RECONNECT
+// Called whenever a session error is detected anywhere.
+// Cooldown guard (isReconnecting) ensures this only runs once
+// even if multiple errors fire at the same time.
+// ===================================================
+async function reconnect() {
+    if (isReconnecting) {
+        log('⏳ Reconnection already in progress — skipping duplicate trigger.');
+        return;
+    }
+    isReconnecting = true;
+    clientReady = false;
+    stats.reconnections++;
+    log(`🔄 Self-healing triggered (reconnection #${stats.reconnections}). Reinitialising WhatsApp...`);
+
+    try {
+        await client.destroy();
+        log('🔄 Client destroyed cleanly. Reinitialising in 5s...');
+    } catch (e) {
+        log(`🔄 Destroy error (non-critical): ${e.message}`);
+    }
+
+    // Wait 5 seconds before reinitialising — gives Puppeteer time to
+    // fully release resources on the 1GB RAM machine before spinning
+    // up a new browser instance.
+    setTimeout(async () => {
+        try {
+            await client.initialize();
+            log('🔄 Reinitialisation triggered — waiting for ready event...');
+        } catch (e) {
+            log(`🚨 Reinitialisation failed: ${e.message}`);
+        } finally {
+            // Release the cooldown guard whether it succeeded or not
+            // so future errors can trigger another attempt
+            isReconnecting = false;
+        }
+    }, 5000);
 }
 
 // ===================================================
@@ -83,6 +124,7 @@ const client = new Client({
 client.on('qr', (qr) => {
     latestQR = qr;
     clientReady = false;
+    isReconnecting = false;  // QR appearing means reinitialisation worked
     log('⚠️ Session needs authentication. QR available at /qr endpoint (also printed below).');
     qrcodeTerminal.generate(qr, { small: true });
 });
@@ -90,12 +132,14 @@ client.on('qr', (qr) => {
 client.on('ready', () => {
     clientReady = true;
     latestQR = null;
+    isReconnecting = false;  // Clear cooldown on successful reconnect
     log('🛡️ Alert Bridge operational and listening for EarthRanger traffic.');
 });
 
 client.on('disconnected', (reason) => {
     clientReady = false;
-    log(`🔌 WhatsApp DISCONNECTED: ${reason}. Health check will now fail => expect an email alert.`);
+    log(`🔌 WhatsApp DISCONNECTED: ${reason}. Triggering self-heal...`);
+    reconnect();
 });
 
 client.on('auth_failure', (msg) => {
@@ -107,10 +151,8 @@ client.on('auth_failure', (msg) => {
 // CENTRAL ROUTING PROCESSOR
 // ===================================================
 client.on('message', async (msg) => {
-    // Ignore group echo and status broadcasts
     if (msg.from === TARGET_GROUP) return;
     if (msg.from === 'status@broadcast') return;
-    // Ignore media-only / empty-body messages
     if (!msg.body) return;
 
     log(`📥 Packet received from: ${msg.from}`);
@@ -123,12 +165,9 @@ client.on('message', async (msg) => {
         stats.failures++;
         log(`❌ FAILURE delivering to group: ${err.message}`);
 
-        // KEY LESSON: if this is a session/frame error, the WhatsApp
-        // browser context has died. Mark as not ready so /health returns
-        // 503 and the uptime watchdog fires an email alert.
         if (isSessionError(err)) {
-            clientReady = false;
-            log('🔌 Session error detected during send — marking bridge as DISCONNECTED.');
+            log('🔌 Session error detected during send — triggering self-heal.');
+            reconnect();
         }
 
         try {
@@ -137,8 +176,7 @@ client.on('message', async (msg) => {
         } catch (backupErr) {
             log(`🚨 Double failure — backup route offline: ${backupErr.message}`);
             if (isSessionError(backupErr)) {
-                clientReady = false;
-                log('🔌 Session error on backup route — marking bridge as DISCONNECTED.');
+                reconnect();
             }
         }
     }
@@ -146,14 +184,6 @@ client.on('message', async (msg) => {
 
 // ===================================================
 // DAILY DIGEST — clocked by Google's pings, no internal timers.
-// On each /health ping, if the calendar date has rolled over,
-// send yesterday's summary to your personal number.
-//
-// LESSON: We now wrap this in isSessionError() detection.
-// Previously a detached frame here would fail silently — the digest
-// error was swallowed, clientReady stayed true, and the watchdog
-// never knew WhatsApp had broken. Now it correctly flags the bridge
-// as disconnected so you get emailed.
 // ===================================================
 async function maybeSendDailyDigest() {
     const today = new Date().toDateString();
@@ -167,34 +197,25 @@ async function maybeSendDailyDigest() {
             `Alerts forwarded (since last restart): ${stats.forwarded}\n` +
             `Delivery failures: ${stats.failures}\n` +
             `Last alert: ${stats.lastAlertAt ? stats.lastAlertAt.toISOString() : 'none yet'}\n` +
+            `Reconnections: ${stats.reconnections}\n` +
             `Process uptime: ${uptimeHrs}h`);
         log('📊 Daily digest sent.');
     } catch (e) {
         log(`Digest send failed: ${e.message}`);
-        // If the digest fails with a session error, flip the health check
-        // so the uptime watchdog catches it and emails you.
         if (isSessionError(e)) {
-            clientReady = false;
-            log('🔌 Session error detected during digest — marking bridge as DISCONNECTED.');
+            log('🔌 Session error during digest — triggering self-heal.');
+            reconnect();
         }
     }
 }
 
 // ===================================================
 // HTTP GATEWAY + CONTROL PANEL
-// Routes:
-//   /health            (public)  200 if WhatsApp connected, 503 if not
-//   /status?key=SECRET           JSON stats
-//   /logs?key=SECRET             last 150 log lines as plain text
-//   /qr?key=SECRET               scannable QR image in browser when session drops
-//   /restart?key=SECRET          clean restart (PM2 auto-resurrects)
-//   /deploy?key=SECRET           git pull latest code, then restart
 // ===================================================
 http.createServer(async (req, res) => {
     const u = new URL(req.url, `http://localhost:${PORT}`);
     const authed = u.searchParams.get('key') === SECRET_KEY;
 
-    // --- Public health check (Google Uptime Monitor target) ---
     if (u.pathname === '/health' || u.pathname === '/') {
         maybeSendDailyDigest();
         if (clientReady) {
@@ -202,12 +223,11 @@ http.createServer(async (req, res) => {
             res.end(JSON.stringify({ status: 'ALIVE', whatsapp: 'CONNECTED', engine: 'GCP-ALERT-BRIDGE' }));
         } else {
             res.writeHead(503, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'DEGRADED', whatsapp: 'DISCONNECTED' }));
+            res.end(JSON.stringify({ status: 'DEGRADED', whatsapp: 'DISCONNECTED', reconnecting: isReconnecting }));
         }
         return;
     }
 
-    // --- Everything below requires the secret key ---
     if (!authed) {
         res.writeHead(403, { 'Content-Type': 'text/plain' });
         res.end('Forbidden');
@@ -219,6 +239,7 @@ http.createServer(async (req, res) => {
         res.end(JSON.stringify({
             whatsappConnected: clientReady,
             qrPending: !!latestQR,
+            isReconnecting,
             ...stats,
             memoryMB: Math.round(process.memoryUsage().rss / 1048576)
         }, null, 2));
