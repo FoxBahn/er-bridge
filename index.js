@@ -118,7 +118,8 @@ puppeteer: {
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-gpu',
-            '--no-zygote'
+            '--no-zygote',
+            '--single-process'
         ]
     }
 });
