@@ -111,6 +111,7 @@ const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
         headless: true,
+        protocolTimeout: 120000,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -119,9 +120,6 @@ const client = new Client({
             '--no-zygote',
             '--single-process'
         ]
-    },
-    puppeteerOptions: {
-        timeout: 60000
     }
 });
 
